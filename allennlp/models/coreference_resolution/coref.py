@@ -3,6 +3,7 @@ import math
 from typing import Any, Dict, List, Optional
 
 import torch
+
 import torch.nn.functional as F
 from torch.autograd import Variable
 
@@ -14,6 +15,7 @@ from allennlp.modules import FeedForward
 from allennlp.modules import Seq2SeqEncoder, TimeDistributed, TextFieldEmbedder
 from allennlp.nn import util, InitializerApplicator, RegularizerApplicator
 from allennlp.training.metrics import MentionRecall, ConllCorefScores
+from allennlp.models.coreference_resolution.coref_util import custom_rnn
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
@@ -60,11 +62,14 @@ class CoreferenceResolver(Model):
                  context_layer: Seq2SeqEncoder,
                  mention_feedforward: FeedForward,
                  antecedent_feedforward: FeedForward,
+                 # Default
                  feature_size: int,
                  max_span_width: int,
                  spans_per_word: float,
                  max_antecedents: int,
+                 typing: str, 
                  lexical_dropout: float = 0.2,
+                 # Added params 
                  initializer: InitializerApplicator = InitializerApplicator(),
                  regularizer: Optional[RegularizerApplicator] = None) -> None:
         super(CoreferenceResolver, self).__init__(vocab, regularizer)
@@ -85,6 +90,7 @@ class CoreferenceResolver(Model):
         self._spans_per_word = spans_per_word
         self._max_antecedents = max_antecedents
 
+        self._typing = typing
         self._mention_recall = MentionRecall()
         self._conll_coref_scores = ConllCorefScores()
         if lexical_dropout > 0:
@@ -92,12 +98,66 @@ class CoreferenceResolver(Model):
         else:
             self._lexical_dropout = lambda x: x
         initializer(self)
+       
+        self._loaded_type_head_scorer, self._loaded_type_lstm, self._loaded_type_feedforward = self._load_type_model()
+    
+    def _load_type_model(self):
+        """
+        Parameters
+        ----------
+        text_embeddings: torch.FloatTensor
+        span_ends: torch.FloatTensor
+          The end indices 
+        span_size : 
+
+        Returns
+        ----------
+          type_pred_embeddings: torch.FloatTensor
+            The result embedding of applying typing layers.
+        """
+        checkpoint = torch.load(self._typing)
+        # Define LSTM to encode context.
+        lstm_output_dim = 100
+        output_dim = lstm_output_dim * 2 * 2 + 300 # lstm_dimension * bidirection * start and end  + mention_dim
+        type_feedforward = torch.nn.Linear(output_dim, 350, bias=False)
+        type_lstm = torch.nn.LSTM(300, 100, num_layers=1, bidirectional=True, batch_first=True)
+        head_scorer = torch.nn.Linear(300, 1, bias=True)
+        """
+        for key, item in checkpoint['state_dict'].items():
+          if key == "lstm.bias_ih_l0_reverse":
+            pass
+            #type_lstm.bias_ih_l0_reverse = torch.nn.Parameter(data=item, requires_grad=False)
+          elif key == "lstm.bias_hh_l0_reverse":        
+            pass
+          elif key == "lstm.weight_ih_l0_reverse":        
+            pass
+          elif key == "lstm.weight_hh_l0_reverse":        
+            pass
+          elif key == "lstm.bias_ih_l0":        
+            pass
+          elif key == "lstm.bias_hh_l0":        
+            pass
+          elif key == "lstm.weight_ih_l0":        
+            pass
+          elif key == "lstm.weight_hh_l0":        
+            pass
+          elif key == "head_attentive_sum.key_maker.weight":        
+            pass
+          elif key == "decoder.linear.weight":        
+            pass
+          elif key == "decoder.linear.bias":        
+            pass
+        """
+        return head_scorer, type_lstm, type_feedforward
+
+ 
 
     def _compute_head_attention(self,
-                                head_scores: torch.FloatTensor,
-                                text_embeddings: torch.FloatTensor,
-                                span_ends: torch.IntTensor,
-                                span_size: torch.IntTensor):
+                               head_scores: torch.FloatTensor,
+                               type_head_scores: torch.FloatTensor,
+                               text_embeddings: torch.FloatTensor,
+                               span_ends: torch.IntTensor,
+                               span_size: torch.IntTensor):
         """
         Parameters
         ----------
@@ -105,6 +165,8 @@ class CoreferenceResolver(Model):
             Unnormalized attention scores for every word. This score is shared for every candidate. The
             only way in which the attention weights differ over different spans is in the set of words
             over which they are normalized.
+        type_head_scores: torch.FloatTensor
+            Unnormalized attention scores from type prediction network. 
         text_embeddings: torch.FloatTensor
             The embeddings over which we are computing a weighted sum.
         span_ends: torch.IntTensor
@@ -133,27 +195,57 @@ class CoreferenceResolver(Model):
 
         # Shape: (batch_size, num_spans, max_span_width)
         span_head_scores = util.batched_index_select(head_scores, head_indices, flat_head_indices).squeeze(-1)
+        span_type_head_scores = util.batched_index_select(type_head_scores, head_indices, flat_head_indices).squeeze(-1)
         span_head_scores += head_mask.float().log()
+        span_type_head_scores += head_mask.float().log()
 
         # Shape: (batch_size * num_spans, max_span_width)
         flat_span_head_scores = span_head_scores.view(-1, self._max_span_width)
+        flat_span_type_head_scores = span_type_head_scores.view(-1, self._max_span_width)
         flat_span_head_weights = F.softmax(flat_span_head_scores)
+        flat_span_type_head_weights = F.softmax(flat_span_type_head_scores)
 
         # Shape: (batch_size * num_spans, 1, max_span_width)
         flat_span_head_weights = flat_span_head_weights.unsqueeze(1)
+        flat_span_type_head_weights = flat_span_type_head_weights.unsqueeze(1)
 
         # Shape: (batch_size * num_spans, max_span_width, embedding_size)
         flat_span_text_embeddings = span_text_embeddings.view(-1,
                                                               self._max_span_width,
                                                               span_text_embeddings.size(-1))
+        flat_span_text_embeddings_300 = flat_span_text_embeddings[:,:,:300]
 
         # Shape: (batch_size * num_spans, 1, embedding_size)
         flat_attended_text_embeddings = flat_span_head_weights.bmm(flat_span_text_embeddings)
+        flat_attended_type_text_embeddings = flat_span_type_head_weights.bmm(flat_span_text_embeddings_300)
 
         # Shape: (batch_size, num_spans, embedding_size)
         attended_text_embeddings = flat_attended_text_embeddings.view(text_embeddings.size(0),
                                                                       span_ends.size(1), -1)
-        return attended_text_embeddings
+        attended_type_text_embeddings = flat_attended_type_text_embeddings.view(text_embeddings.size(0),
+                                                                                span_ends.size(1), -1)
+        return attended_text_embeddings, attended_type_text_embeddings
+
+
+    def _type_embedding_layer(self, text_embeddings, text_mask, 
+                                    span_starts, span_ends, attended_text_embeddings):
+        """
+        Computes an embedded representation for each text span for typing prediction.
+        * Use preloaded lstm weights.
+        Returns
+        -------
+        type_embeddings:
+          (batch_size, num_spans, embedding_size [350] (output of type feed forward))
+        """
+        text_embeddings = text_embeddings[:,:,:300]
+        lstm_output = custom_rnn(text_embeddings, text_mask, self._loaded_type_lstm)
+        # (batch_size, text_length, embedding_size) 
+        start_embeddings = util.batched_index_select(lstm_output, span_starts.squeeze(-1))
+        end_embeddings = util.batched_index_select(lstm_output, span_ends.squeeze(-1))
+        context_rep = torch.cat((start_embeddings, end_embeddings, attended_text_embeddings), 2)
+        type_embed = self._loaded_type_feedforward(context_rep)
+        return type_embed
+
 
     def _compute_span_representations(self,
                                       text_embeddings: torch.FloatTensor,
@@ -185,6 +277,9 @@ class CoreferenceResolver(Model):
         contextualized_embeddings = self._context_layer(text_embeddings, text_mask)
 
         # Shape: (batch_size, num_spans, embedding_size)
+        #print('check types...')
+        #print(contextualized_embeddings)
+        #print(span_starts.squeeze(-1))
         start_embeddings = util.batched_index_select(contextualized_embeddings, span_starts.squeeze(-1))
         end_embeddings = util.batched_index_select(contextualized_embeddings, span_ends.squeeze(-1))
 
@@ -196,18 +291,25 @@ class CoreferenceResolver(Model):
 
         # Shape: (batch_size, text_len, 1)
         head_scores = self._head_scorer(contextualized_embeddings)
-
+        type_head_scores = self._loaded_type_head_scorer(contextualized_embeddings[:,:,:300])
+        
         # Shape: (batch_size, num_spans, embedding_size)
-        attended_text_embeddings = self._compute_head_attention(head_scores,
+        attended_text_embeddings, attended_type_text_embeddings = self._compute_head_attention(head_scores,
+                                                                type_head_scores,
                                                                 text_embeddings,
                                                                 span_ends,
                                                                 span_width)
+        
         # (batch_size, num_spans, context_layer.get_output_dim() * 2 + embedding_size + feature_size)
         span_embeddings = torch.cat([start_embeddings,
                                      end_embeddings,
                                      span_width_embeddings,
                                      attended_text_embeddings], -1)
-        return span_embeddings
+
+        #TODO (eunsol): maybe augment here?
+        augmented_span_embeddings = self._type_embedding_layer(text_embeddings, text_mask,
+                                    span_starts, span_ends, attended_type_text_embeddings)
+        return span_embeddings, augmented_span_embeddings
 
     @staticmethod
     def _prune_and_sort_spans(mention_scores: torch.FloatTensor, num_spans_to_keep: int):
@@ -456,7 +558,7 @@ class CoreferenceResolver(Model):
         span_ends = F.relu(span_ends.float()).long()
 
         # Shape: (batch_size, num_spans, embedding_size)
-        span_embeddings = self._compute_span_representations(text_embeddings,
+        span_embeddings, span_type_embeddings = self._compute_span_representations(text_embeddings,
                                                              text_mask,
                                                              span_starts,
                                                              span_ends)
@@ -471,7 +573,7 @@ class CoreferenceResolver(Model):
 
         # Shape: (batch_size, num_spans_to_keep)
         top_span_indices = self._prune_and_sort_spans(mention_scores, num_spans_to_keep)
-
+        
         # Shape: (batch_size * num_spans_to_keep)
         flat_top_span_indices = util.flatten_and_batch_shift_indices(top_span_indices, span_starts.size(1))
 
@@ -479,6 +581,12 @@ class CoreferenceResolver(Model):
         # top spans based on the mention scorer.
         # Shape: (batch_size, num_spans_to_keep, embedding_size)
         top_span_embeddings = util.batched_index_select(span_embeddings, top_span_indices, flat_top_span_indices)
+        ####
+        top_span_type_embeddings = util.batched_index_select(span_type_embeddings, top_span_indices, flat_top_span_indices)
+ 
+        top_span_embeddings = torch.cat([top_span_embeddings, top_span_type_embeddings], 2)
+        # MAYBE ADD IN HERE? top_span_embedding [batch_size, num_spans_to_keep, embedding_size + type_embedding_size] ?
+        # which is already quite a lot.. 1220
 
         # Shape: (batch_size, num_spans_to_keep, 1)
         top_span_mask = util.batched_index_select(span_mask, top_span_indices, flat_top_span_indices)
@@ -570,29 +678,10 @@ class CoreferenceResolver(Model):
         mention_feedforward = FeedForward.from_params(params.pop("mention_feedforward"))
         antecedent_feedforward = FeedForward.from_params(params.pop("antecedent_feedforward"))
 
+        typing = params.pop("typing")
+        
         feature_size = params.pop("feature_size")
         max_span_width = params.pop("max_span_width")
         spans_per_word = params.pop("spans_per_word")
         max_antecedents = params.pop("max_antecedents")
         lexical_dropout = params.pop("lexical_dropout", 0.2)
-
-        init_params = params.pop("initializer", None)
-        reg_params = params.pop("regularizer", None)
-        initializer = (InitializerApplicator.from_params(init_params)
-                       if init_params is not None
-                       else InitializerApplicator())
-        regularizer = RegularizerApplicator.from_params(reg_params) if reg_params is not None else None
-
-        params.assert_empty(cls.__name__)
-        return cls(vocab=vocab,
-                   text_field_embedder=text_field_embedder,
-                   context_layer=context_layer,
-                   mention_feedforward=mention_feedforward,
-                   antecedent_feedforward=antecedent_feedforward,
-                   feature_size=feature_size,
-                   max_span_width=max_span_width,
-                   spans_per_word=spans_per_word,
-                   max_antecedents=max_antecedents,
-                   lexical_dropout=lexical_dropout,
-                   initializer=initializer,
-                   regularizer=regularizer)

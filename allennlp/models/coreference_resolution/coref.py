@@ -98,8 +98,9 @@ class CoreferenceResolver(Model):
         else:
             self._lexical_dropout = lambda x: x
         initializer(self)
-       
-        self._loaded_type_head_scorer, self._loaded_type_lstm, self._loaded_type_feedforward = self._load_type_model()
+        
+        if typing: 
+          self._loaded_type_head_scorer, self._loaded_type_lstm, self._loaded_type_feedforward = self._load_type_model()
     
     def _load_type_model(self):
         """
@@ -119,42 +120,43 @@ class CoreferenceResolver(Model):
         # Define LSTM to encode context.
         lstm_output_dim = 100
         output_dim = lstm_output_dim * 2 * 2 + 300 # lstm_dimension * bidirection * start and end  + mention_dim
-        type_feedforward = torch.nn.Linear(output_dim, 350, bias=False)
+        type_feedforward = torch.nn.Linear(output_dim, 350, bias=True)
         type_lstm = torch.nn.LSTM(300, 100, num_layers=1, bidirectional=True, batch_first=True)
         head_scorer = torch.nn.Linear(300, 1, bias=True)
-        """
         for key, item in checkpoint['state_dict'].items():
           if key == "lstm.bias_ih_l0_reverse":
-            pass
-            #type_lstm.bias_ih_l0_reverse = torch.nn.Parameter(data=item, requires_grad=False)
+            type_lstm.bias_ih_l0_reverse = torch.nn.Parameter(data=item, requires_grad=False)
           elif key == "lstm.bias_hh_l0_reverse":        
-            pass
+            type_lstm.bias_hh_l0_reverse = torch.nn.Parameter(data=item, requires_grad=False)
           elif key == "lstm.weight_ih_l0_reverse":        
-            pass
+            type_lstm.weight_ih_l0_reverse = torch.nn.Parameter(data=item, requires_grad=False)
           elif key == "lstm.weight_hh_l0_reverse":        
-            pass
+            type_lstm.weight_hh_l0_reverse = torch.nn.Parameter(data=item, requires_grad=False)
           elif key == "lstm.bias_ih_l0":        
-            pass
+            type_lstm.bias_ih_l0 = torch.nn.Parameter(data=item, requires_grad=False)
           elif key == "lstm.bias_hh_l0":        
-            pass
+            type_lstm.bias_hh_l0 = torch.nn.Parameter(data=item, requires_grad=False)
           elif key == "lstm.weight_ih_l0":        
-            pass
+            type_lstm.weight_ih_l0 = torch.nn.Parameter(data=item, requires_grad=False)
           elif key == "lstm.weight_hh_l0":        
-            pass
+            type_lstm.weight_hh_l0 = torch.nn.Parameter(data=item, requires_grad=False)
           elif key == "head_attentive_sum.key_maker.weight":        
-            pass
+            head_scorer.weight = torch.nn.Parameter(data=item, requires_grad=False)
           elif key == "decoder.linear.weight":        
-            pass
-          elif key == "decoder.linear.bias":        
-            pass
-        """
+            type_feedforward.weight = torch.nn.Parameter(data=item, requires_grad=False)
+          elif key == "head_attentive_sum.key_maker.bias":        
+            head_scorer.bias = torch.nn.Parameter(data=item, requires_grad=False)
+          elif key == "decoder.linear.bias":
+            type_feedforward.bias = torch.nn.Parameter(data=item, requires_grad=False)
+          else:
+            print(key + ' does not map to any parameters in coref model.')
         return head_scorer, type_lstm, type_feedforward
 
  
 
     def _compute_head_attention(self,
                                head_scores: torch.FloatTensor,
-                               type_head_scores: torch.FloatTensor,
+                               type_head_scores,
                                text_embeddings: torch.FloatTensor,
                                span_ends: torch.IntTensor,
                                span_size: torch.IntTensor):
@@ -195,43 +197,45 @@ class CoreferenceResolver(Model):
 
         # Shape: (batch_size, num_spans, max_span_width)
         span_head_scores = util.batched_index_select(head_scores, head_indices, flat_head_indices).squeeze(-1)
-        span_type_head_scores = util.batched_index_select(type_head_scores, head_indices, flat_head_indices).squeeze(-1)
         span_head_scores += head_mask.float().log()
-        span_type_head_scores += head_mask.float().log()
 
         # Shape: (batch_size * num_spans, max_span_width)
         flat_span_head_scores = span_head_scores.view(-1, self._max_span_width)
-        flat_span_type_head_scores = span_type_head_scores.view(-1, self._max_span_width)
         flat_span_head_weights = F.softmax(flat_span_head_scores)
-        flat_span_type_head_weights = F.softmax(flat_span_type_head_scores)
 
         # Shape: (batch_size * num_spans, 1, max_span_width)
         flat_span_head_weights = flat_span_head_weights.unsqueeze(1)
-        flat_span_type_head_weights = flat_span_type_head_weights.unsqueeze(1)
 
         # Shape: (batch_size * num_spans, max_span_width, embedding_size)
         flat_span_text_embeddings = span_text_embeddings.view(-1,
                                                               self._max_span_width,
                                                               span_text_embeddings.size(-1))
-        flat_span_text_embeddings_300 = flat_span_text_embeddings[:,:,:300]
 
         # Shape: (batch_size * num_spans, 1, embedding_size)
         flat_attended_text_embeddings = flat_span_head_weights.bmm(flat_span_text_embeddings)
-        flat_attended_type_text_embeddings = flat_span_type_head_weights.bmm(flat_span_text_embeddings_300)
 
         # Shape: (batch_size, num_spans, embedding_size)
         attended_text_embeddings = flat_attended_text_embeddings.view(text_embeddings.size(0),
                                                                       span_ends.size(1), -1)
-        attended_type_text_embeddings = flat_attended_type_text_embeddings.view(text_embeddings.size(0),
-                                                                                span_ends.size(1), -1)
-        return attended_text_embeddings, attended_type_text_embeddings
+        if self._typing:
+          span_type_head_scores = util.batched_index_select(type_head_scores, head_indices, flat_head_indices).squeeze(-1)
+          span_type_head_scores += head_mask.float().log()
+          flat_span_type_head_scores = span_type_head_scores.view(-1, self._max_span_width)
+          flat_span_type_head_weights = F.softmax(flat_span_type_head_scores)
+          flat_span_type_head_weights = flat_span_type_head_weights.unsqueeze(1)
+          flat_span_text_embeddings_300 = flat_span_text_embeddings[:,:,-300:]
+          flat_attended_type_text_embeddings = flat_span_type_head_weights.bmm(flat_span_text_embeddings_300)
+          attended_type_text_embeddings = flat_attended_type_text_embeddings.view(text_embeddings.size(0),
+                                                                                  span_ends.size(1), -1)
+          return attended_text_embeddings, attended_type_text_embeddings
+        return attended_text_embeddings
 
 
     def _type_embedding_layer(self, text_embeddings, text_mask, 
                                     span_starts, span_ends, attended_text_embeddings):
         """
         Computes an embedded representation for each text span for typing prediction.
-        * Use preloaded lstm weights.
+        Using preloaded lstm weights.
         Returns
         -------
         type_embeddings:
@@ -277,8 +281,6 @@ class CoreferenceResolver(Model):
         contextualized_embeddings = self._context_layer(text_embeddings, text_mask)
 
         # Shape: (batch_size, num_spans, embedding_size)
-        #print('check types...')
-        #print(contextualized_embeddings)
         #print(span_starts.squeeze(-1))
         start_embeddings = util.batched_index_select(contextualized_embeddings, span_starts.squeeze(-1))
         end_embeddings = util.batched_index_select(contextualized_embeddings, span_ends.squeeze(-1))
@@ -291,25 +293,36 @@ class CoreferenceResolver(Model):
 
         # Shape: (batch_size, text_len, 1)
         head_scores = self._head_scorer(contextualized_embeddings)
-        type_head_scores = self._loaded_type_head_scorer(contextualized_embeddings[:,:,:300])
-        
+        if not self._typing:
         # Shape: (batch_size, num_spans, embedding_size)
-        attended_text_embeddings, attended_type_text_embeddings = self._compute_head_attention(head_scores,
-                                                                type_head_scores,
+          attended_text_embeddings = self._compute_head_attention(head_scores,
+                                                                None,
                                                                 text_embeddings,
                                                                 span_ends,
                                                                 span_width)
         
-        # (batch_size, num_spans, context_layer.get_output_dim() * 2 + embedding_size + feature_size)
-        span_embeddings = torch.cat([start_embeddings,
-                                     end_embeddings,
+          # (batch_size, num_spans, context_layer.get_output_dim() * 2 + embedding_size + feature_size)
+          span_embeddings = torch.cat([start_embeddings,
+                                    end_embeddings,
                                      span_width_embeddings,
                                      attended_text_embeddings], -1)
-
         #TODO (eunsol): maybe augment here?
-        augmented_span_embeddings = self._type_embedding_layer(text_embeddings, text_mask,
-                                    span_starts, span_ends, attended_type_text_embeddings)
-        return span_embeddings, augmented_span_embeddings
+        if self._typing:
+          type_head_scores = self._loaded_type_head_scorer(contextualized_embeddings[:,:,-300:])
+          attended_text_embeddings, attended_type_text_embeddings = self._compute_head_attention(head_scores,
+                                                                type_head_scores,
+                                                                text_embeddings,
+                                                                span_ends,
+                                                                span_width)
+          span_embeddings = torch.cat([start_embeddings,
+                                       end_embeddings,
+                                       span_width_embeddings,
+                                       attended_text_embeddings], -1)
+
+          augmented_span_embeddings = self._type_embedding_layer(text_embeddings, text_mask,
+                                                                 span_starts, span_ends, attended_type_text_embeddings)
+          return span_embeddings, augmented_span_embeddings
+        return span_embeddings, None
 
     @staticmethod
     def _prune_and_sort_spans(mention_scores: torch.FloatTensor, num_spans_to_keep: int):
@@ -582,11 +595,9 @@ class CoreferenceResolver(Model):
         # Shape: (batch_size, num_spans_to_keep, embedding_size)
         top_span_embeddings = util.batched_index_select(span_embeddings, top_span_indices, flat_top_span_indices)
         ####
-        top_span_type_embeddings = util.batched_index_select(span_type_embeddings, top_span_indices, flat_top_span_indices)
- 
-        top_span_embeddings = torch.cat([top_span_embeddings, top_span_type_embeddings], 2)
-        # MAYBE ADD IN HERE? top_span_embedding [batch_size, num_spans_to_keep, embedding_size + type_embedding_size] ?
-        # which is already quite a lot.. 1220
+        if self._typing:
+          top_span_type_embeddings = util.batched_index_select(span_type_embeddings, top_span_indices, flat_top_span_indices)
+          top_span_embeddings = torch.cat([top_span_embeddings, top_span_type_embeddings], 2)
 
         # Shape: (batch_size, num_spans_to_keep, 1)
         top_span_mask = util.batched_index_select(span_mask, top_span_indices, flat_top_span_indices)
@@ -685,3 +696,25 @@ class CoreferenceResolver(Model):
         spans_per_word = params.pop("spans_per_word")
         max_antecedents = params.pop("max_antecedents")
         lexical_dropout = params.pop("lexical_dropout", 0.2)
+
+        init_params = params.pop("initializer", None)
+        reg_params = params.pop("regularizer", None)
+        initializer = (InitializerApplicator.from_params(init_params)
+                       if init_params is not None
+                       else InitializerApplicator())
+        regularizer = RegularizerApplicator.from_params(reg_params) if reg_params is not None else None
+
+        params.assert_empty(cls.__name__)
+        return cls(vocab=vocab,
+                   text_field_embedder=text_field_embedder,
+                   context_layer=context_layer,
+                   mention_feedforward=mention_feedforward,
+                   antecedent_feedforward=antecedent_feedforward,
+                   feature_size=feature_size,
+                   typing=typing,
+                   max_span_width=max_span_width,
+                   spans_per_word=spans_per_word,
+                   max_antecedents=max_antecedents,
+                   lexical_dropout=lexical_dropout,
+                   initializer=initializer,
+                   regularizer=regularizer)

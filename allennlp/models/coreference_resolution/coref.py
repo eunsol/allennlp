@@ -3,6 +3,7 @@ import math
 from typing import Any, Dict, List, Optional
 
 import torch
+import numpy as np
 
 import torch.nn.functional as F
 from torch.autograd import Variable
@@ -67,6 +68,7 @@ class CoreferenceResolver(Model):
                  max_span_width: int,
                  spans_per_word: float,
                  max_antecedents: int,
+                 add_type_mention: bool,
                  typing: str, 
                  lexical_dropout: float = 0.2,
                  # Added params 
@@ -91,6 +93,7 @@ class CoreferenceResolver(Model):
         self._max_antecedents = max_antecedents
 
         self._typing = typing
+        self._add_type_mention = add_type_mention
         self._mention_recall = MentionRecall()
         self._conll_coref_scores = ConllCorefScores()
         if lexical_dropout > 0:
@@ -120,9 +123,14 @@ class CoreferenceResolver(Model):
         # Define LSTM to encode context.
         lstm_output_dim = 100
         output_dim = lstm_output_dim * 2 * 2 + 300 # lstm_dimension * bidirection * start and end  + mention_dim
-        type_feedforward = torch.nn.Linear(output_dim, 350, bias=True)
         type_lstm = torch.nn.LSTM(300, 100, num_layers=1, bidirectional=True, batch_first=True)
-        head_scorer = torch.nn.Linear(300, 1, bias=True)
+        if self._add_type_mention:
+          type_feedforward = torch.nn.Linear(output_dim, 350, bias=True)
+          head_scorer = torch.nn.Linear(300, 1, bias=True)
+        else:
+          type_feedforward = None
+          head_scorer = None
+
         for key, item in checkpoint['state_dict'].items():
           if key == "lstm.bias_ih_l0_reverse":
             type_lstm.bias_ih_l0_reverse = torch.nn.Parameter(data=item, requires_grad=False)
@@ -140,13 +148,13 @@ class CoreferenceResolver(Model):
             type_lstm.weight_ih_l0 = torch.nn.Parameter(data=item, requires_grad=False)
           elif key == "lstm.weight_hh_l0":        
             type_lstm.weight_hh_l0 = torch.nn.Parameter(data=item, requires_grad=False)
-          elif key == "head_attentive_sum.key_maker.weight":        
+          elif key == "head_attentive_sum.key_maker.weight" and self._add_type_mention:        
             head_scorer.weight = torch.nn.Parameter(data=item, requires_grad=False)
-          elif key == "decoder.linear.weight":        
+          elif key == "decoder.linear.weight" and self._add_type_mention:        
             type_feedforward.weight = torch.nn.Parameter(data=item, requires_grad=False)
-          elif key == "head_attentive_sum.key_maker.bias":        
+          elif key == "head_attentive_sum.key_maker.bias" and self._add_type_mention:        
             head_scorer.bias = torch.nn.Parameter(data=item, requires_grad=False)
-          elif key == "decoder.linear.bias":
+          elif key == "decoder.linear.bias" and self._add_type_mention:
             type_feedforward.bias = torch.nn.Parameter(data=item, requires_grad=False)
           else:
             print(key + ' does not map to any parameters in coref model.')
@@ -217,7 +225,7 @@ class CoreferenceResolver(Model):
         # Shape: (batch_size, num_spans, embedding_size)
         attended_text_embeddings = flat_attended_text_embeddings.view(text_embeddings.size(0),
                                                                       span_ends.size(1), -1)
-        if self._typing:
+        if self._typing and self._add_type_mention:
           span_type_head_scores = util.batched_index_select(type_head_scores, head_indices, flat_head_indices).squeeze(-1)
           span_type_head_scores += head_mask.float().log()
           flat_span_type_head_scores = span_type_head_scores.view(-1, self._max_span_width)
@@ -246,8 +254,15 @@ class CoreferenceResolver(Model):
         # (batch_size, text_length, embedding_size) 
         start_embeddings = util.batched_index_select(lstm_output, span_starts.squeeze(-1))
         end_embeddings = util.batched_index_select(lstm_output, span_ends.squeeze(-1))
-        context_rep = torch.cat((start_embeddings, end_embeddings, attended_text_embeddings), 2)
-        type_embed = self._loaded_type_feedforward(context_rep)
+        if self._add_type_mention:
+          context_rep = torch.cat((start_embeddings, end_embeddings, attended_text_embeddings), 2)
+          type_embed = self._loaded_type_feedforward(context_rep)
+        else:
+          context_rep = torch.cat((start_embeddings, end_embeddings), 2)
+          type_embed = context_rep
+          np.save('/home/eunsol/Project/allennlp/debug_coref.npy', type_embed.data.cpu().numpy())
+          print('SAVE DONE!')
+          raise ValueError("ending now")
         return type_embed
 
 
@@ -293,7 +308,7 @@ class CoreferenceResolver(Model):
 
         # Shape: (batch_size, text_len, 1)
         head_scores = self._head_scorer(contextualized_embeddings)
-        if not self._typing:
+        if not self._add_type_mention:
         # Shape: (batch_size, num_spans, embedding_size)
           attended_text_embeddings = self._compute_head_attention(head_scores,
                                                                 None,
@@ -303,17 +318,21 @@ class CoreferenceResolver(Model):
         
           # (batch_size, num_spans, context_layer.get_output_dim() * 2 + embedding_size + feature_size)
           span_embeddings = torch.cat([start_embeddings,
-                                    end_embeddings,
-                                     span_width_embeddings,
-                                     attended_text_embeddings], -1)
+                                       end_embeddings,
+                                       span_width_embeddings,
+                                       attended_text_embeddings], -1)
+
+          augmented_span_embeddings = self._type_embedding_layer(text_embeddings, text_mask,
+                                                                 span_starts, span_ends, None)
+          return span_embeddings, augmented_span_embeddings
         #TODO (eunsol): maybe augment here?
         if self._typing:
-          type_head_scores = self._loaded_type_head_scorer(contextualized_embeddings[:,:,-300:])
+          type_head_scores = self._loaded_type_head_scorer(contextualized_embeddings[:,:,-300:]) if self._add_type_mention else None
           attended_text_embeddings, attended_type_text_embeddings = self._compute_head_attention(head_scores,
-                                                                type_head_scores,
-                                                                text_embeddings,
-                                                                span_ends,
-                                                                span_width)
+                                                              type_head_scores,
+                                                              text_embeddings,
+                                                              span_ends,
+                                                              span_width)
           span_embeddings = torch.cat([start_embeddings,
                                        end_embeddings,
                                        span_width_embeddings,
@@ -690,7 +709,8 @@ class CoreferenceResolver(Model):
         antecedent_feedforward = FeedForward.from_params(params.pop("antecedent_feedforward"))
 
         typing = params.pop("typing")
-        
+        add_type_mention = params.pop("add_type_mention")
+ 
         feature_size = params.pop("feature_size")
         max_span_width = params.pop("max_span_width")
         spans_per_word = params.pop("spans_per_word")
@@ -712,6 +732,7 @@ class CoreferenceResolver(Model):
                    antecedent_feedforward=antecedent_feedforward,
                    feature_size=feature_size,
                    typing=typing,
+                   add_type_mention=add_type_mention,
                    max_span_width=max_span_width,
                    spans_per_word=spans_per_word,
                    max_antecedents=max_antecedents,
